@@ -1,106 +1,88 @@
-// ── AgroLink Service Worker ────────────────────────
-// Caches all app assets for full offline support
+// ── AgroLink Service Worker v2 ────────────────────
+// Uses relative paths — works on any deploy URL
 
-const CACHE_NAME = 'agrolink-v1';
-const ASSETS = [
-  '/index.html',
-  '/styles.css',
-  '/app.js',
-  '/manifest.json',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
-  // Google Fonts (cached on first load)
+const CACHE = 'agrolink-v2';
+
+// Core assets to pre-cache
+const SHELL = [
+  './',
+  './index.html',
+  './styles.css',
+  './app.js',
+  './manifest.json',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
 ];
 
-// ── INSTALL: cache all core assets ────────────────
-self.addEventListener('install', event => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => {
-      console.log('[SW] Caching app shell');
-      return cache.addAll(ASSETS);
-    })
+// ── INSTALL ───────────────────────────────────────
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE)
+      .then(cache => cache.addAll(SHELL))
+      .then(() => self.skipWaiting())
   );
-  // Take control immediately without waiting
-  self.skipWaiting();
 });
 
-// ── ACTIVATE: clean up old caches ─────────────────
-self.addEventListener('activate', event => {
-  event.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(
-        keys
-          .filter(key => key !== CACHE_NAME)
-          .map(key => {
-            console.log('[SW] Deleting old cache:', key);
-            return caches.delete(key);
-          })
-      )
-    )
+// ── ACTIVATE ─────────────────────────────────────
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(
+        keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
   );
-  // Claim all open clients immediately
-  self.clients.claim();
 });
 
-// ── FETCH: cache-first with network fallback ───────
-self.addEventListener('fetch', event => {
-  // Only handle GET requests
-  if (event.request.method !== 'GET') return;
+// ── FETCH ─────────────────────────────────────────
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
 
-  // For Google Fonts — network first, then cache
-  if (event.request.url.includes('fonts.googleapis.com') ||
-      event.request.url.includes('fonts.gstatic.com')) {
-    event.respondWith(
-      caches.open(CACHE_NAME).then(cache =>
-        fetch(event.request)
-          .then(response => {
-            cache.put(event.request, response.clone());
-            return response;
-          })
-          .catch(() => caches.match(event.request))
-      )
-    );
+  const url = e.request.url;
+
+  // Google Fonts — network first, cache fallback
+  if (url.includes('fonts.googleapis.com') || url.includes('fonts.gstatic.com')) {
+    e.respondWith(networkFirstThenCache(e.request));
     return;
   }
 
-  // For all other requests — cache first, then network
-  event.respondWith(
-    caches.match(event.request).then(cached => {
-      if (cached) {
-        // Return cached version and update in background
-        const fetchPromise = fetch(event.request).then(response => {
-          caches.open(CACHE_NAME).then(cache => {
-            cache.put(event.request, response.clone());
-          });
-          return response;
-        }).catch(() => cached);
-
-        return cached;
-      }
-
-      // Not in cache — fetch from network and cache it
-      return fetch(event.request).then(response => {
-        if (!response || response.status !== 200 || response.type === 'opaque') {
-          return response;
-        }
-        const toCache = response.clone();
-        caches.open(CACHE_NAME).then(cache => cache.put(event.request, toCache));
-        return response;
-      }).catch(() => {
-        // Offline fallback for navigation requests
-        if (event.request.destination === 'document') {
-          return caches.match('/index.html');
-        }
-      });
-    })
-  );
+  // App shell — cache first, then network
+  e.respondWith(cacheFirstThenNetwork(e.request));
 });
 
-// ── BACKGROUND SYNC placeholder ───────────────────
-// (For future: queue price data refreshes when back online)
-self.addEventListener('sync', event => {
-  if (event.tag === 'sync-prices') {
-    console.log('[SW] Background sync: prices');
-    // TODO: fetch fresh market prices and update cache
+async function cacheFirstThenNetwork(req) {
+  const cached = await caches.match(req);
+  if (cached) {
+    // Refresh in background (stale-while-revalidate)
+    fetch(req).then(res => {
+      if (res && res.ok) caches.open(CACHE).then(c => c.put(req, res));
+    }).catch(() => {});
+    return cached;
   }
-});
+  try {
+    const res = await fetch(req);
+    if (res && res.ok && res.type !== 'opaque') {
+      const clone = res.clone();
+      caches.open(CACHE).then(c => c.put(req, clone));
+    }
+    return res;
+  } catch {
+    // Offline fallback: return cached index.html for navigation
+    if (req.destination === 'document') {
+      return caches.match('./index.html');
+    }
+  }
+}
+
+async function networkFirstThenCache(req) {
+  try {
+    const res = await fetch(req);
+    if (res && res.ok) {
+      const clone = res.clone();
+      caches.open(CACHE).then(c => c.put(req, clone));
+    }
+    return res;
+  } catch {
+    return caches.match(req);
+  }
+}
